@@ -1,0 +1,96 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: 2021 SUSE LLC
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+
+# Functions to allow showing dialogs (or other stuff) on all consoles.
+# At its core, it works by spawning processes with the given command on each
+# console and waits for them to finish. If any exits with an exit status other
+# than 254, the others are killed and the status returned.
+
+# The inner workings are a bit complex, mostly to workaround bash not being
+# able to for any process to exit, returning pid + status. It can only wait
+# for multiple processes (PIDs) to exit or return the exit status of any
+# process, but not the corresponding PID. There is no way to deal with
+# background processes which exit before "wait" was called. In the case that
+# there is no background process anymore, "wait" simply returns 0.
+# As a workaround, the spawned background processes stay alive until killed
+# explicitly and report their exit status through a FIFO.
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf $tmpdir' EXIT
+
+# This function is called for each console and basically runs "$@" on the
+# console given in $1 and writes its exit status into the fifo.
+# Bash doesn't forward signals to its child processes, instead that needs
+# to be done explicitly. This is necessary for "dialog" to restore the tty.
+dialog_subproc() {
+	local console="$1"
+	shift
+	"$@" <>"$console" >&0 &
+	pid=$!
+	trap 'kill $pid; exit 0' SIGTERM
+	ret=0
+	wait $pid || ret=$?
+	# Undo the trap to not kill the already dead process and also
+	# avoid waiting for the current process (sleep 1) before handling it.
+	trap - SIGTERM
+	echo "$ret" > $tmpdir/fifo
+	# Stay around until explicitly killed.
+	while :; do sleep 1; done
+}
+
+dialog_on_all_consoles() {
+	# Needed to tell apart errors and escape
+	export DIALOG_ERROR=254
+	# The linux fbcon uses this, most serial consoles should be fine too
+	export TERM=linux
+
+	# Create a FIFO for communicating the status
+	rm -f "${tmpdir}/fifo"
+	mkfifo "${tmpdir}/fifo"
+
+	# For every entry in /proc/consoles, create a background process
+	local pids=()
+	while read console rest; do
+		console="/dev/${console}"
+		[ -r "${console}" ] || continue
+	        dialog_subproc $console "$@" &
+		pids+=($!)
+	done </proc/consoles
+
+	# Wait for either all processes to fail or one to succeed
+	local finished=0
+	while read status < "${tmpdir}/fifo"; do
+		((finished++)) || :
+		[ $finished -eq ${#pids[@]} ] && break
+		[ $status -eq 254 ] || break
+	done
+
+	# All done, kill remaining processes
+	kill "${pids[@]}" || :
+	wait "${pids[@]}" || :
+
+	return $status
+}
+
+# The signal handling code requires the use of "exec" in the process, so even
+# when using current stdout/stderr a background process + "wait" are needed.
+dialog_on_std() {
+	"$@" &
+	wait $! || return $?
+}
+
+ask() {
+	exec dialog --yesno "$1" 10 30
+}
+
+msg() {
+	exec dialog --msgbox "$1" 10 30
+}
+
+if dialog_on_all_consoles ask "Yes or No?"; then
+	dialog_on_all_consoles msg "You selected Yes"
+else
+	dialog_on_all_consoles msg "You selected No"
+fi
