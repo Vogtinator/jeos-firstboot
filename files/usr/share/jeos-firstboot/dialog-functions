@@ -1,0 +1,177 @@
+#!/bin/bash
+. /usr/share/jeos-firstboot/jeos-firstboot-functions
+
+# Functions to allow showing dialogs (or other stuff) on all consoles.
+# At its core, it works by spawning processes with the given command on each
+# console and waits for them to finish. If any exits with an exit status other
+# than 254, the others are killed and the status returned.
+
+# The inner workings are a bit complex, mostly to workaround bash not being
+# able to for any process to exit, returning pid + status. It can only wait
+# for multiple processes (PIDs) to exit or return the exit status of any
+# process, but not the corresponding PID. There is no way to deal with
+# background processes which exit before "wait" was called. In the case that
+# there is no background process anymore, "wait" simply returns 0.
+# As a workaround, the spawned background processes stay alive until killed
+# explicitly and report their exit status through a FIFO.
+
+fifodir=
+
+# This function is called for each console and basically runs "$@" on the
+# console given in $1 and writes its exit status into the fifo.
+# Bash doesn't forward signals to its child processes, instead that needs
+# to be done explicitly. This is necessary for "dialog" to restore the tty.
+console_subproc() {
+	local console="$1"
+	shift
+	"$@" <>"$console" >&0 &
+	pid=$!
+	trap 'kill $pid; exit 0' SIGTERM
+	ret=0
+	wait $pid || ret=$?
+	# Undo the trap to not kill the already dead process and also
+	# avoid waiting for the current process (sleep 1) before handling it.
+	trap - SIGTERM
+	echo "$ret" > $fifodir/fifo
+	# Stay around until explicitly killed.
+	while :; do sleep 1; done
+}
+
+on_all_consoles() {
+	# Needed to tell apart errors and escape
+	export DIALOG_ERROR=254
+	# The linux fbcon uses this, most serial consoles should be fine too
+	export TERM=linux
+
+	# Create a FIFO for communicating the status
+	fifodir="$(mktemp -d)"
+	mkfifo "${fifodir}/fifo"
+
+	# For every entry in /proc/consoles, create a background process
+	local pids=()
+	while read console rest; do
+		console="/dev/${console}"
+		[ -r "${console}" ] || continue
+	        console_subproc $console "$@" &
+		pids+=($!)
+	done </proc/consoles
+
+	# Wait for either all processes to fail or one to succeed
+	local finished=0
+	while read status < "${fifodir}/fifo"; do
+		((finished++)) || :
+		[ $finished -eq ${#pids[@]} ] && break
+		[ $status -eq 254 ] || break
+	done
+
+	# All done, kill remaining processes
+	kill "${pids[@]}" || :
+	wait "${pids[@]}" || :
+
+	rm -rf "$fifodir"
+	fifodir=
+
+	return $status
+}
+
+# The signal handling code requires the use of "exec" in the process, so even
+# when using current stdout/stderr a background process + "wait" are needed.
+on_stdio() {
+	# Use stdin explicitly to avoid that bash discards it
+	"$@" </dev/stdin &
+	wait $! || return $?
+}
+
+on_selected_consoles() {
+	if [ -n "${JEOS_ON_ALL_CONSOLES+x}" ]; then
+		on_all_consoles "$@"
+	else
+		on_stdio "$@"
+	fi
+}
+
+stty_size() {
+	set -- `stty size`; LINES=$1; COLUMNS=$2
+	# stty size can return zero when not ready or
+	# its a serial console
+	if [ "$COLUMNS" = "0" -o "$LINES" = "0" ]; then
+		LINES=24
+		COLUMNS=80
+	fi
+}
+
+dialog_retry() {
+	retval=
+	dialog_out="$(mktemp)"
+	while true
+	do
+		retval=0
+		on_selected_consoles "$@" 3>$dialog_out || retval=$?
+		case $retval in
+		  0)
+			# need || true as dialog doesn't write newlines
+			read result < $dialog_out || true
+			rm "$dialog_out"
+			return 0
+			;;
+		  1)
+			echo "$(xargs -a "$dialog_out")" >/var/log/jeos
+			on_selected_consoles dialog --backtitle "$PRETTY_NAME" --yesno $"Do you really want to quit?" 0 0 && exit 1
+			continue
+			;;
+		  255)
+			# xargs to remove whitespaces
+			echo "$(xargs -a "$dialog_out")" >/var/log/jeos
+			result_error="$(xargs -a "$dialog_out")"
+			if [ -z "$result_error" ]; then
+				on_selected_consoles dialog --backtitle "$PRETTY_NAME" --yesno $"Do you really want to quit?" 0 0 && exit 1
+				continue
+			fi
+			logger -p err -t jeos-firstboot "$result_error"
+			on_selected_consoles dialog --backtitle "$PRETTY_NAME" --msgbox $"Exiting due to error, please check the system log" 0 0
+			rm "$dialog_out"
+			exit 2
+			;;
+		esac
+	done
+}
+
+d_msg() {
+	exec dialog --backtitle "$PRETTY_NAME" --msgbox "$@"
+}
+
+d_menu() {
+	local title=$1
+	shift
+	local default=$1
+	shift
+	local default_arg=()
+	[ -n "$default" ] && default_arg=(--default-item "$default")
+	exec dialog --backtitle "$PRETTY_NAME" --output-fd 3 "${default_arg[@]}" --menu "$title" 0 0 "$(menuheight $#)" "$@"
+}
+
+# Given the number of total item pairs, outputs the number of items to display at once
+menuheight() {
+	local height=$(($1 / 2))
+
+	stty_size
+	let dh_menu=LINES-15
+
+	[ "$height" -le "$dh_menu" ] || height="$dh_menu"
+	echo $height
+}
+
+	default="de_DE"
+        list=() # Set by findlocales
+        newlocale="$default"
+        if ! findlocales; then
+                dialog_retry d_msg $"No locales found"
+        elif [ "${#list[@]}" -eq 2 ]; then # Only a single entry
+                newlocale="${list[0]}"
+        else
+                dialog_retry d_menu $"Select system locale" "${default}" "${list[@]}"
+                newlocale="${result}"
+        fi
+
+dialog_retry d_msg "You entered '$newlocale'!" 5 26
+dialog_retry d_msg "Success!" 5 26
